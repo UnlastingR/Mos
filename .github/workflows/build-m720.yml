@@ -1,0 +1,131 @@
+name: Build Mos with M720 wake fix
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - "Mos/**"
+      - "MosTests/**"
+      - "Mos.xcodeproj/**"
+      - "scripts/qa/**"
+      - ".github/workflows/build-m720.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mos-m720-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test-and-build:
+    runs-on: macos-15
+    timeout-minutes: 45
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.3.app/Contents/Developer
+      LOGI_REAL_DEVICE: "0"
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Show toolchain
+        run: |
+          xcodebuild -version
+          swift --version
+          git log -2 --oneline
+
+      - name: Check Logi module boundaries
+        run: bash scripts/qa/lint-logi-boundary.sh
+
+      - name: Resolve pinned Swift packages
+        run: |
+          xcodebuild -resolvePackageDependencies \
+            -project Mos.xcodeproj -scheme Debug \
+            -clonedSourcePackagesDirPath "$RUNNER_TEMP/MosSourcePackages" \
+            -onlyUsePackageVersionsFromResolvedFile
+
+      - name: Run regression tests
+        run: |
+          set -o pipefail
+          xcodebuild test \
+            -project Mos.xcodeproj -scheme Debug -configuration Debug \
+            -testPlan Debug \
+            -destination "platform=macOS,arch=$(uname -m)" \
+            -parallel-testing-enabled NO \
+            -derivedDataPath "$RUNNER_TEMP/MosTests" \
+            -clonedSourcePackagesDirPath "$RUNNER_TEMP/MosSourcePackages" \
+            -disableAutomaticPackageResolution \
+            -resultBundlePath "$RUNNER_TEMP/MosTests.xcresult" \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" DEVELOPMENT_TEAM="" \
+            | tee "$RUNNER_TEMP/mos-tests.log"
+
+      - name: Build universal app
+        run: |
+          set -o pipefail
+          xcodebuild build \
+            -project Mos.xcodeproj -scheme Debug -configuration Release \
+            -destination 'generic/platform=macOS' \
+            -derivedDataPath "$RUNNER_TEMP/MosRelease" \
+            -clonedSourcePackagesDirPath "$RUNNER_TEMP/MosSourcePackages" \
+            -disableAutomaticPackageResolution \
+            ARCHS="arm64 x86_64" ONLY_ACTIVE_ARCH=NO \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" DEVELOPMENT_TEAM="" \
+            | tee "$RUNNER_TEMP/mos-build.log"
+
+      - name: Package personal test build
+        env:
+          BUILD_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          app="$RUNNER_TEMP/MosRelease/Build/Products/Release/Mos.app"
+          test -d "$app"
+          codesign --force --deep --sign - "$app"
+          codesign --verify --deep --strict "$app"
+          lipo -verify_arch arm64 x86_64 "$app/Contents/MacOS/Mos"
+          mkdir -p artifacts
+          zip_name="Mos-M720-wake-${BUILD_SHA:0:8}-universal.zip"
+          ditto -c -k --norsrc --noextattr --keepParent "$app" "artifacts/$zip_name"
+          if zipinfo -1 "artifacts/$zip_name" | grep -q '/\._'; then
+            echo 'Unexpected AppleDouble files in app archive' >&2
+            exit 1
+          fi
+          shasum -a 256 "artifacts/$zip_name" > artifacts/SHA256SUMS.txt
+          {
+            echo 'Personal Mos test build'
+            echo "Source commit: $BUILD_SHA"
+            echo 'Includes Caldis/Mos pull request #1012 by LJAYi.'
+            echo 'Universal app for Apple silicon and Intel Macs.'
+            echo 'Ad-hoc signed; not Apple-notarized.'
+            echo 'Real M720 idle/wake validation must be performed on a connected mouse.'
+          } > artifacts/BUILD-INFO.txt
+          {
+            echo '### M720 wake-fix build'
+            echo "Commit: \`$BUILD_SHA\`"
+            echo 'Regression tests passed. Download the app ZIP from this run’s artifacts.'
+            echo 'The app is ad-hoc signed and has not been Apple-notarized.'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload app
+        uses: actions/upload-artifact@v4
+        with:
+          name: Mos-M720-wake-universal-${{ github.run_number }}
+          path: artifacts/
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload test and build diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Mos-build-diagnostics-${{ github.run_number }}
+          path: |
+            ${{ runner.temp }}/mos-tests.log
+            ${{ runner.temp }}/mos-build.log
+            ${{ runner.temp }}/MosTests.xcresult
+          if-no-files-found: ignore
+          retention-days: 7
