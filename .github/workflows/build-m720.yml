@@ -98,7 +98,7 @@ jobs:
           {
             echo 'Personal Mos test build'
             echo "Source commit: $BUILD_SHA"
-            echo 'Includes Caldis/Mos pull request #1012 by LJAYi.'
+            echo 'Based on LJAYi PR #1012; replaces unconditional re-divert with guarded readback and one repair pass.'
             echo 'Universal app for Apple silicon and Intel Macs.'
             echo 'Ad-hoc signed; not Apple-notarized.'
             echo 'Real M720 idle/wake validation must be performed on a connected mouse.'
@@ -106,7 +106,7 @@ jobs:
           {
             echo '### M720 wake-fix build'
             echo "Commit: \`$BUILD_SHA\`"
-            echo 'Regression tests passed. Download the app ZIP from this run’s artifacts.'
+            echo 'Regression tests passed. Download the app ZIP from the artifacts for this run.'
             echo 'The app is ad-hoc signed and has not been Apple-notarized.'
           } >> "$GITHUB_STEP_SUMMARY"
 

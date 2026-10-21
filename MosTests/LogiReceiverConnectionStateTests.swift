@@ -248,27 +248,105 @@ final class LogiReceiverConnectionStateTests: XCTestCase {
         )
     }
 
-    // MARK: - receiver idle wake detection
+    // MARK: - Bounded probe-then-repair after idle activity
 
-    func testFirstReceiverReportDoesNotCountAsWake() {
-        XCTAssertFalse(LogiDeviceSession.receiverReportIndicatesWake(
-            previousTime: nil,
-            currentTime: 100
-        ))
+    private let wakeBindings: Set<UInt16> = [0x005B, 0x005D, 0x00D0]
+
+    private func startedWakeProbe() -> LogiReceiverWakeRecovery {
+        var recovery = LogiReceiverWakeRecovery()
+        XCTAssertTrue(recovery.noteActivity(at: 100, expectedCIDs: wakeBindings).isEmpty)
+        XCTAssertEqual(recovery.noteActivity(at: 160, expectedCIDs: wakeBindings), wakeBindings)
+        return recovery
     }
 
-    func testReceiverReportAfterLongSilenceCountsAsWake() {
-        XCTAssertTrue(LogiDeviceSession.receiverReportIndicatesWake(
-            previousTime: 100,
-            currentTime: 160
-        ))
+    func testHealthyWakeDoesNotWriteAnyDivert() {
+        var recovery = startedWakeProbe()
+        for cid in wakeBindings {
+            XCTAssertTrue(recovery.receive(cid: cid, flags: 0x01, softwareID: recovery.softwareID))
+        }
+        XCTAssertTrue(recovery.finish(currentExpectedCIDs: wakeBindings).isEmpty)
     }
 
-    func testReceiverReportDuringNormalActivityDoesNotCountAsWake() {
-        XCTAssertFalse(LogiDeviceSession.receiverReportIndicatesWake(
-            previousTime: 100,
-            currentTime: 159.9
-        ))
+    func testCapturedM720LostTiltStateRepairsOnlyThoseControlsOnce() {
+        var recovery = startedWakeProbe()
+        XCTAssertTrue(recovery.receive(cid: 0x005B, flags: 0x00, softwareID: recovery.softwareID))
+        XCTAssertTrue(recovery.receive(cid: 0x005D, flags: 0x00, softwareID: recovery.softwareID))
+        XCTAssertTrue(recovery.receive(cid: 0x00D0, flags: 0x01, softwareID: recovery.softwareID))
+        XCTAssertEqual(recovery.finish(currentExpectedCIDs: wakeBindings), [0x005B, 0x005D])
+        XCTAssertTrue(recovery.finish(currentExpectedCIDs: wakeBindings).isEmpty)
+        XCTAssertFalse(recovery.receive(cid: 0x005B, flags: 0, softwareID: recovery.softwareID))
+    }
+
+    func testTimeoutDoesNotTreatUnansweredControlsAsLost() {
+        var recovery = startedWakeProbe()
+        XCTAssertTrue(recovery.receive(cid: 0x005B, flags: 0, softwareID: recovery.softwareID))
+        XCTAssertEqual(recovery.finish(currentExpectedCIDs: wakeBindings), [0x005B])
+        var noResponse = startedWakeProbe()
+        XCTAssertTrue(noResponse.finish(currentExpectedCIDs: wakeBindings).isEmpty)
+    }
+
+    func testNormalUIQueryCannotAuthorizeWakeRepair() {
+        var recovery = startedWakeProbe()
+        XCTAssertFalse(recovery.receive(cid: 0x005B, flags: 0, softwareID: 1))
+        XCTAssertFalse(recovery.receive(cid: 0x0053, flags: 0, softwareID: recovery.softwareID))
+        XCTAssertTrue(recovery.finish(currentExpectedCIDs: wakeBindings).isEmpty)
+    }
+
+    func testDuplicateOrPriorWakeReplyCannotAuthorizeAnotherRepair() {
+        var recovery = startedWakeProbe()
+        let oldID = recovery.softwareID
+        XCTAssertTrue(recovery.receive(cid: 0x005B, flags: 1, softwareID: oldID))
+        XCTAssertFalse(recovery.receive(cid: 0x005B, flags: 0, softwareID: oldID))
+        XCTAssertTrue(recovery.finish(currentExpectedCIDs: wakeBindings).isEmpty)
+        XCTAssertEqual(recovery.noteActivity(at: 220, expectedCIDs: wakeBindings), wakeBindings)
+        XCTAssertNotEqual(recovery.softwareID, oldID)
+        XCTAssertFalse(recovery.receive(cid: 0x005B, flags: 0, softwareID: oldID))
+        XCTAssertTrue(recovery.finish(currentExpectedCIDs: wakeBindings).isEmpty)
+    }
+
+    func testDisabledBindingOrContendedControlIsNotRepaired() {
+        var recovery = startedWakeProbe()
+        for cid in wakeBindings {
+            XCTAssertTrue(recovery.receive(cid: cid, flags: 0, softwareID: recovery.softwareID))
+        }
+        XCTAssertEqual(recovery.finish(currentExpectedCIDs: [0x00D0]), [0x00D0])
+    }
+
+    func testDisconnectOrManualRediscoveryCancelsPendingRepair() {
+        var recovery = startedWakeProbe()
+        let token = recovery.softwareID
+        XCTAssertTrue(recovery.receive(cid: 0x005B, flags: 0, softwareID: token))
+        recovery.cancel()
+        XCTAssertFalse(recovery.receive(cid: 0x005D, flags: 0, softwareID: token))
+        XCTAssertTrue(recovery.finish(currentExpectedCIDs: wakeBindings).isEmpty)
+    }
+
+    func testWakeDoesNotContinuouslyProbeDuringNormalActivity() {
+        var recovery = startedWakeProbe()
+        XCTAssertTrue(recovery.noteActivity(at: 161, expectedCIDs: wakeBindings).isEmpty)
+        _ = recovery.finish(currentExpectedCIDs: wakeBindings)
+        XCTAssertTrue(recovery.noteActivity(at: 170, expectedCIDs: wakeBindings).isEmpty)
+        XCTAssertTrue(recovery.noteActivity(at: 229, expectedCIDs: wakeBindings).isEmpty)
+        XCTAssertEqual(recovery.noteActivity(at: 289, expectedCIDs: wakeBindings), wakeBindings)
+    }
+
+    func testSlotsKeepIndependentWakeReadbackState() {
+        var first = startedWakeProbe()
+        var second = startedWakeProbe()
+        XCTAssertTrue(first.receive(cid: 0x005B, flags: 0, softwareID: first.softwareID))
+        for cid in wakeBindings {
+            XCTAssertTrue(second.receive(cid: cid, flags: 1, softwareID: second.softwareID))
+        }
+        XCTAssertTrue(second.finish(currentExpectedCIDs: wakeBindings).isEmpty)
+        XCTAssertEqual(first.finish(currentExpectedCIDs: wakeBindings), [0x005B])
+    }
+
+    func testOfflineOrUnboundSlotOnlyRecordsActivityWithoutProbing() {
+        var recovery = LogiReceiverWakeRecovery()
+        XCTAssertTrue(recovery.noteActivity(at: 100, expectedCIDs: []).isEmpty)
+        XCTAssertTrue(recovery.noteActivity(at: 160, expectedCIDs: []).isEmpty)
+        XCTAssertTrue(recovery.noteActivity(at: 161, expectedCIDs: wakeBindings).isEmpty)
+        XCTAssertEqual(recovery.noteActivity(at: 221, expectedCIDs: wakeBindings), wakeBindings)
     }
 
     // MARK: - receiverSlotConnectionAction (Phase 4 热插拔)

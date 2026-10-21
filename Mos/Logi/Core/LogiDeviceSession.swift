@@ -41,6 +41,47 @@ struct LogiButtonStateTracker {
     }
 }
 
+/// One bounded readback batch per observed idle transition. Unknown/late replies
+/// never authorize writes; each confirmed missing CID can be repaired only once.
+struct LogiReceiverWakeRecovery {
+    static let idleThreshold: TimeInterval = 60
+    private var lastActivityTime: TimeInterval?
+    private(set) var softwareID: UInt8 = 1
+    private(set) var pendingCIDs: Set<UInt16> = []
+    private var missingCIDs: Set<UInt16> = []
+
+    mutating func noteActivity(at time: TimeInterval, expectedCIDs: Set<UInt16>) -> Set<UInt16> {
+        defer { lastActivityTime = time }
+        guard let previous = lastActivityTime,
+              time - previous >= Self.idleThreshold,
+              pendingCIDs.isEmpty,
+              !expectedCIDs.isEmpty else { return [] }
+        // Keep normal discovery/UI traffic (software ID 1) out of this batch.
+        softwareID = softwareID == 0x0F ? 2 : softwareID + 1
+        pendingCIDs = expectedCIDs
+        missingCIDs.removeAll()
+        return expectedCIDs
+    }
+
+    mutating func receive(cid: UInt16, flags: UInt8, softwareID: UInt8) -> Bool {
+        guard softwareID == self.softwareID,
+              pendingCIDs.remove(cid) != nil else { return false }
+        if flags & 0x01 == 0 { missingCIDs.insert(cid) }
+        return true
+    }
+
+    mutating func finish(currentExpectedCIDs: Set<UInt16>) -> Set<UInt16> {
+        let repair = missingCIDs.intersection(currentExpectedCIDs)
+        cancel()
+        return repair
+    }
+
+    mutating func cancel() {
+        pendingCIDs.removeAll()
+        missingCIDs.removeAll()
+    }
+}
+
 class LogiDeviceSession {
 
     // MARK: - Public
@@ -121,10 +162,8 @@ class LogiDeviceSession {
     // Some peripherals lose temporary divert while asleep without sending the
     // receiver's 0x41 disconnect/reconnect notification. The first report after
     // a quiet period is the only reliable wake signal observed from those devices.
-    private static let receiverIdleWakeThreshold: TimeInterval = 60
-    private static let receiverWakeRestoreDelays: [TimeInterval] = [1.0, 2.0]
-    private var lastReceiverReportTime: [UInt8: TimeInterval] = [:]
-    private var receiverWakeRestoreWorkItems: [UInt8: [DispatchWorkItem]] = [:]
+    private var receiverWakeRecovery: [UInt8: LogiReceiverWakeRecovery] = [:]
+    private var receiverWakeProbeTimeouts: [UInt8: DispatchWorkItem] = [:]
 
     // MARK: - Report Buffer
     private var reportBufferPtr: UnsafeMutablePointer<UInt8>?
@@ -496,6 +535,7 @@ class LogiDeviceSession {
             phase: .normal,
             policy: policy
         )
+        if targetCIDs != lastApplied { cancelReceiverWakeProbe(slot: deviceIndex) }
         let toDivert = targetCIDs.subtracting(self.lastApplied)
         let toUndivert = self.lastApplied.subtracting(targetCIDs).union(nativeFirstCIDs)
         #if DEBUG
@@ -913,14 +953,6 @@ class LogiDeviceSession {
         return .drop
     }
 
-    static func receiverReportIndicatesWake(
-        previousTime: TimeInterval?,
-        currentTime: TimeInterval
-    ) -> Bool {
-        guard let previousTime = previousTime else { return false }
-        return currentTime - previousTime >= receiverIdleWakeThreshold
-    }
-
     /// 多设备热插拔(§Phase 4): 某 slot 的 0x41 连接/断开通知该做什么(纯决策).
     /// - 断开: 若该 slot 正被接管 -> release(释放其按键状态 + 标记未 init); 否则 ignore
     /// - 连接: 若已接管 -> ignore(防振荡, "已 init 且在线则忽略"); 否则若是 divert 候选 -> takeover
@@ -1053,9 +1085,9 @@ class LogiDeviceSession {
         receiverOptionalProbedSlots.removeAll()
         receiverTakeoverDebounce.values.forEach { $0.cancel() }
         receiverTakeoverDebounce.removeAll()
-        receiverWakeRestoreWorkItems.values.flatMap { $0 }.forEach { $0.cancel() }
-        receiverWakeRestoreWorkItems.removeAll()
-        lastReceiverReportTime.removeAll()
+        receiverWakeProbeTimeouts.values.forEach { $0.cancel() }
+        receiverWakeProbeTimeouts.removeAll()
+        receiverWakeRecovery.removeAll()
         discoveryTimer?.invalidate()
         discoveryTimer = nil
         controlInfoQueryTimer?.invalidate()
@@ -1096,7 +1128,7 @@ class LogiDeviceSession {
     /// 发送 HID++ 请求
     /// BLE 直连: long report (20 bytes) + report ID in payload (hidapi 兼容)
     /// Receiver: TODO - 可能需要不同格式, 待 Bolt/Unifying 测试后实现
-    private func sendRequest(featureIndex: UInt8, functionId: UInt8, params: [UInt8] = []) {
+    private func sendRequest(featureIndex: UInt8, functionId: UInt8, params: [UInt8] = [], softwareID: UInt8 = 1) {
         var report: [UInt8]
         let result: IOReturn
 
@@ -1107,7 +1139,7 @@ class LogiDeviceSession {
             report[0] = Self.hidppLongReportId
             report[1] = deviceIndex
             report[2] = featureIndex
-            report[3] = (functionId << 4) | 0x01
+            report[3] = (functionId << 4) | (softwareID & 0x0F)
             for (i, p) in params.prefix(16).enumerated() { report[4 + i] = p }
             result = IOHIDDeviceSetReport(
                 hidDevice, kIOHIDReportTypeOutput,
@@ -1122,7 +1154,7 @@ class LogiDeviceSession {
             report[0] = Self.hidppLongReportId
             report[1] = deviceIndex
             report[2] = featureIndex
-            report[3] = (functionId << 4) | 0x01
+            report[3] = (functionId << 4) | (softwareID & 0x0F)
             for (i, p) in params.prefix(16).enumerated() { report[4 + i] = p }
             result = IOHIDDeviceSetReport(
                 hidDevice, kIOHIDReportTypeOutput,
@@ -1434,6 +1466,7 @@ class LogiDeviceSession {
     /// 只清 dict 不主动触发 callback(nil): 旧响应到达时找不到 callback 自然被忽略,
     /// 避免触发 markHandshakeComplete 造成 ready→init 的 UI 闪烁.
     private func cancelInflightDiscovery() {
+        for slot in Array(receiverWakeProbeTimeouts.keys) { cancelReceiverWakeProbe(slot: slot) }
         discoveryTimer?.invalidate(); discoveryTimer = nil
         controlInfoQueryTimer?.invalidate(); controlInfoQueryTimer = nil
         reportingQueryTimer?.invalidate(); reportingQueryTimer = nil
@@ -1464,6 +1497,7 @@ class LogiDeviceSession {
     }
 
     func redivertAllControls() {
+        cancelReceiverWakeProbe(slot: deviceIndex)
         releaseAllActiveButtonState(reason: "redivert")
         cancelBLEStandardUndivertGuard()
         reprogInitComplete = true
@@ -1473,41 +1507,100 @@ class LogiDeviceSession {
         LogiDebugPanel.log("[\(deviceInfo.name)] Re-synced divert with bindings")
     }
 
-    private func noteReceiverPeripheralReport(slot: UInt8) {
-        let now = Date.timeIntervalSinceReferenceDate
-        let wokeFromIdle = Self.receiverReportIndicatesWake(
-            previousTime: lastReceiverReportTime[slot],
-            currentTime: now
-        )
-        lastReceiverReportTime[slot] = now
-
-        guard wokeFromIdle,
-              receiverManagedSlots.contains(slot),
-              slotStates[slot]?.reprogInitComplete == true,
-              !(slotStates[slot]?.lastApplied.isEmpty ?? true) else { return }
-
-        receiverWakeRestoreWorkItems[slot]?.forEach { $0.cancel() }
-        LogiDebugPanel.log("[\(deviceInfo.name)] Slot \(slot) resumed after idle; scheduling divert restore")
-        receiverWakeRestoreWorkItems[slot] = Self.receiverWakeRestoreDelays.map { delay in
-            let item = DispatchWorkItem { [weak self] in
-                guard let self = self,
-                      self.receiverManagedSlots.contains(slot),
-                      self.slotStates[slot]?.reprogInitComplete == true else { return }
-                let savedDeviceIndex = self.deviceIndex
-                self.deviceIndex = slot
-                self.redivertAllControls()
-                self.deviceIndex = savedDeviceIndex
-            }
-            DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: item)
-            return item
+    private var receiverWakeExpectedCIDs: Set<UInt16> {
+        guard !LogiCenter.shared.isRecording else { return [] }
+        return lastApplied.intersection(divertedCIDs).filter { cid in
+            Self.shouldUseHIDPPDelivery(mode: LogiSessionManager.shared.deliveryMode(for: ownershipKey(forCID: cid)))
         }
     }
 
-    private func cancelReceiverWakeRestore(slot: UInt8) {
-        receiverWakeRestoreWorkItems.removeValue(forKey: slot)?.forEach { $0.cancel() }
+    private func noteReceiverPeripheralReport(slot: UInt8, softwareID: UInt8) {
+        // Only unsolicited peripheral activity can infer wake. Responses to our
+        // own queries must never create another recovery cycle.
+        guard softwareID == 0 else { return }
+        let savedDeviceIndex = deviceIndex
+        deviceIndex = slot
+        defer { deviceIndex = savedDeviceIndex }
+        let canProbe = receiverManagedSlots.contains(slot) && reprogInitComplete
+            && !receiverSweepActive && !discoveryInFlight
+            && pendingDiscovery.isEmpty && controlInfoQueryTimer == nil
+            && reportingQueryTimer == nil && featureIndex[Self.featureReprogV4] != nil
+        let expected = canProbe ? receiverWakeExpectedCIDs : []
+        let cids = receiverWakeRecovery[slot, default: LogiReceiverWakeRecovery()].noteActivity(
+            at: ProcessInfo.processInfo.systemUptime, expectedCIDs: expected
+        )
+        guard !cids.isEmpty, let idx = featureIndex[Self.featureReprogV4] else { return }
+        let token = receiverWakeRecovery[slot]!.softwareID
+        LogiDebugPanel.log("[\(deviceInfo.name)] Slot \(slot) activity after idle; probing \(cids.count) bound controls once")
+        let timeout = DispatchWorkItem { [weak self] in
+            guard let self = self, self.receiverWakeRecovery[slot]?.softwareID == token else { return }
+            self.finishReceiverWakeProbe(slot: slot)
+        }
+        receiverWakeProbeTimeouts[slot]?.cancel()
+        receiverWakeProbeTimeouts[slot] = timeout
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0, execute: timeout)
+        for cid in cids.sorted() {
+            sendRequest(featureIndex: idx, functionId: 2,
+                        params: [UInt8(cid >> 8), UInt8(cid & 0xFF)], softwareID: token)
+        }
+    }
+
+    private func handleReceiverWakeProbeResponse(_ report: UnsafeBufferPointer<UInt8>) -> Bool {
+        guard connectionMode == .receiver, report.count >= 9,
+              report[3] >> 4 == 2, report[3] & 0x0F >= 2 else { return false }
+        let cid = (UInt16(report[4]) << 8) | UInt16(report[5])
+        let slot = deviceIndex
+        guard receiverWakeRecovery[slot]?.receive(cid: cid, flags: report[6], softwareID: report[3] & 0x0F) == true else {
+            return true // Unmatched/late probe response: never advance the UI/discovery query.
+        }
+        LogiDebugPanel.log("[\(deviceInfo.name)] Slot \(slot) wake readback CID \(String(format: "0x%04X", cid)): flags=\(String(format: "0x%02X", report[6]))")
+        updateDiscoveredControlReportingState(
+            ReportingResponse(cid: cid, reportingFlags: report[6], targetCID: (UInt16(report[7]) << 8) | UInt16(report[8])),
+            markQueried: true
+        )
+        if receiverWakeRecovery[slot]?.pendingCIDs.isEmpty == true {
+            finishReceiverWakeProbe(slot: slot)
+        }
+        return true
+    }
+
+    private func finishReceiverWakeProbe(slot: UInt8) {
+        receiverWakeProbeTimeouts.removeValue(forKey: slot)?.cancel()
+        let savedDeviceIndex = deviceIndex
+        deviceIndex = slot
+        defer { deviceIndex = savedDeviceIndex }
+        let canRepair = receiverManagedSlots.contains(slot) && reprogInitComplete
+            && currentReceiverTargetIsConnected && !discoveryInFlight
+        let missing = receiverWakeRecovery[slot]?.finish(
+            currentExpectedCIDs: canRepair ? receiverWakeExpectedCIDs : []
+        ) ?? []
+        guard !missing.isEmpty, let idx = featureIndex[Self.featureReprogV4] else {
+            LogiDebugPanel.log("[\(deviceInfo.name)] Slot \(slot) wake probe complete; no confirmed missing divert to repair")
+            return
+        }
+        releaseActiveButtonState(for: missing, reason: "wake readback confirmed divert lost")
+        for cid in missing.sorted() {
+            // Preserve the existing contention breaker instead of competing
+            // with another application that repeatedly clears the same CID.
+            let mode = LogiSessionManager.shared.recordExternalClear(for: ownershipKey(forCID: cid))
+            guard Self.shouldReassertAfterExternalClear(mode: mode) else {
+                lastApplied.remove(cid)
+                divertedCIDs.remove(cid)
+                LogiDebugPanel.log("[\(deviceInfo.name)] Slot \(slot) wake repair suspended for CID \(String(format: "0x%04X", cid)): \(mode.debugLabel)")
+                continue
+            }
+            setControlReporting(featureIndex: idx, cid: cid, divert: true)
+        }
+        LogiDebugPanel.log("[\(deviceInfo.name)] Slot \(slot) wake repair pass complete (confirmed missing: \(missing.count))")
+    }
+
+    private func cancelReceiverWakeProbe(slot: UInt8) {
+        receiverWakeProbeTimeouts.removeValue(forKey: slot)?.cancel()
+        receiverWakeRecovery[slot]?.cancel()
     }
 
     func undivertAllControls() {
+        cancelReceiverWakeProbe(slot: deviceIndex)
         releaseAllActiveButtonState(reason: "undivert all")
         cancelBLEStandardUndivertGuard()
         guard currentReceiverTargetIsConnected else {
@@ -1532,6 +1625,7 @@ class LogiDeviceSession {
     }
 
     func toggleDivert(cid: UInt16) {
+        cancelReceiverWakeProbe(slot: deviceIndex)
         guard let idx = featureIndex[Self.featureReprogV4] else { return }
         guard currentReceiverTargetIsConnected else { return }
         let currentlyDiverted = divertedCIDs.contains(cid)
@@ -2091,6 +2185,8 @@ class LogiDeviceSession {
 
     /// 某接管 slot 断开: 只释放该 slot 的按键状态并标记未 init, 不动别的 slot.
     private func handleReceiverSlotRelease(slot: UInt8) {
+        cancelReceiverWakeProbe(slot: slot)
+        receiverWakeRecovery.removeValue(forKey: slot)
         receiverManagedSlots.remove(slot)
         pendingDivertSlots.removeAll { $0 == slot }
         // scoped 到该 slot 释放其 per-slot 状态 (buttonStateTracker/divertedCIDs/lastApplied 均按 slot).
@@ -3292,6 +3388,9 @@ class LogiDeviceSession {
 
             // 部分接收器不会为初始扫描时休眠的设备补发 0x41. 第一条真实报文足以证明 slot 在线;
             // takeover 启动后丢弃该条尚无可靠 feature 映射的报文, 后续报文走正常路由.
+            if devIdx >= 1 && devIdx <= 6 && featureIdx != Self.hidppErrorFeatureIdx {
+                noteReceiverPeripheralReport(slot: devIdx, softwareID: report[3] & 0x0F)
+            }
             if handleReceiverPeripheralActivity(slot: devIdx) {
                 return
             }
@@ -3313,7 +3412,6 @@ class LogiDeviceSession {
                     LogiDebugPanel.log("[\(deviceInfo.name)] Report from slot \(devIdx) (current target=\(deviceIndex)) dropped (unmanaged)")
                     return
                 }
-                noteReceiverPeripheralReport(slot: devIdx)
             }
         }
 
@@ -3322,6 +3420,11 @@ class LogiDeviceSession {
             let originalFeatureIdx = report.count > 3 ? report[3] : 0
             let originalFuncId: UInt8 = report.count > 4 ? (report[4] >> 4) : 0
             let errorCode = report.count > 6 ? report[6] : 0
+            if connectionMode == .receiver, originalFuncId == 2,
+               report.count > 4, report[4] & 0x0F >= 2 {
+                LogiDebugPanel.log("[\(deviceInfo.name)] Wake readback failed; no repair authorized by this response")
+                return
+            }
             LogiDebugPanel.log("[\(deviceInfo.name)] HID++ Error: feat=\(String(format: "0x%02X", originalFeatureIdx)) func=\(originalFuncId) err=\(String(format: "0x%02X", errorCode))")
 
             // Feature discovery pending callbacks
@@ -3364,6 +3467,7 @@ class LogiDeviceSession {
 
         // REPROG_CONTROLS_V4
         if let reprogIdx = featureIndex[Self.featureReprogV4], featureIdx == reprogIdx {
+            if handleReceiverWakeProbeResponse(report) { return }
             if Self.isGetControlReportingQueryResponse(report),
                handleBLEUndivertGuardReportingResponseIfNeeded(report) {
                 return
@@ -3710,6 +3814,7 @@ class LogiDeviceSession {
 
     /// 开始逐个查询按键的 reporting 状态
     private func startReportingQuery() {
+        cancelReceiverWakeProbe(slot: deviceIndex)
         pendingBLEUndivertGuardQueries.removeAll()
         reportingQueryIndex = 0
         for index in discoveredControls.indices {
@@ -4002,6 +4107,7 @@ class LogiDeviceSession {
 
     /// 录制模式: 临时 divert 所有 divertable 按键
     func temporarilyDivertAll() {
+        cancelReceiverWakeProbe(slot: deviceIndex)
         guard let idx = featureIndex[Self.featureReprogV4] else { return }
         guard currentReceiverTargetIsConnected else { return }
         let divertable = Set(discoveredControls.filter { $0.isDivertable }.map { $0.cid })
@@ -4040,9 +4146,6 @@ class LogiDeviceSession {
     }
 
     private func handleDivertedButtonEvent(_ report: UnsafeBufferPointer<UInt8>) {
-        if connectionMode == .receiver {
-            cancelReceiverWakeRestore(slot: deviceIndex)
-        }
         var activeCIDs: Set<UInt16> = []
         var offset = 4
         while offset + 1 < report.count {
