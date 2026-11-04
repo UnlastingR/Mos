@@ -89,6 +89,7 @@ class LogiDeviceSession {
     let deviceInfo: InputDevice
     let usagePage: Int
     let usage: Int
+    let deviceUsagePairs: [LogiHIDUsagePair]
     let transport: String
 
     // MARK: - Connection Mode
@@ -424,10 +425,15 @@ class LogiDeviceSession {
     // MARK: - Init
 
     init(hidDevice: IOHIDDevice) {
+        let transport = IOHIDDeviceGetProperty(hidDevice, kIOHIDTransportKey as CFString) as? String ?? ""
         self.hidDevice = hidDevice
         self.usagePage = IOHIDDeviceGetProperty(hidDevice, kIOHIDPrimaryUsagePageKey as CFString) as? Int ?? 0
         self.usage = IOHIDDeviceGetProperty(hidDevice, kIOHIDPrimaryUsageKey as CFString) as? Int ?? 0
-        self.transport = IOHIDDeviceGetProperty(hidDevice, kIOHIDTransportKey as CFString) as? String ?? ""
+        self.deviceUsagePairs = LogiHIDUsagePair.fromIOHIDProperty(
+            IOHIDDeviceGetProperty(hidDevice, kIOHIDDeviceUsagePairsKey as CFString)
+        )
+        self.transport = transport
+        self.isBLE = LogiSessionManager.isBluetoothTransport(transport)
         self.deviceInfo = InputDevice(
             vendorId: UInt16(IOHIDDeviceGetProperty(hidDevice, kIOHIDVendorIDKey as CFString) as? Int ?? 0),
             productId: UInt16(IOHIDDeviceGetProperty(hidDevice, kIOHIDProductIDKey as CFString) as? Int ?? 0),
@@ -440,14 +446,37 @@ class LogiDeviceSession {
         reportBufferPtr?.deallocate()
     }
 
-    /// 是否为 HID++ 候选接口
-    var isHIDPPCandidate: Bool {
+    static func isHIDPPCandidate(
+        isBLE: Bool,
+        usagePage: Int,
+        usage: Int,
+        productId: Int = 0,
+        deviceUsagePairs: [LogiHIDUsagePair] = []
+    ) -> Bool {
         // USB: 只有 vendor-specific usage page 支持 HID++
         if !isBLE {
             return usagePage == 0xFF00 || usagePage == 0xFF43 || usagePage == 0xFFC0
         }
-        // BLE: HID++ 复用标准 mouse interface
-        return usagePage == 0x0001 && usage == 0x0002
+        if LogiSessionManager.isLogitechBLEKeyboardProductId(productId) {
+            return false
+        }
+        // BLE: 标准 BLE 鼠标 PrimaryUsage 为 1/2;
+        // M720 等复合 BLE 鼠标 PrimaryUsage 为 1/6, 但同一接口的 DeviceUsagePairs 含 Mouse (1/2)
+        if usagePage == 0x0001 && usage == 0x0002 {
+            return true
+        }
+        return deviceUsagePairs.contains(LogiHIDUsagePair(usagePage: 0x0001, usage: 0x0002))
+    }
+
+    /// 是否为 HID++ 候选接口
+    var isHIDPPCandidate: Bool {
+        return Self.isHIDPPCandidate(
+            isBLE: isBLE,
+            usagePage: usagePage,
+            usage: usage,
+            productId: Int(deviceInfo.productId),
+            deviceUsagePairs: deviceUsagePairs
+        )
     }
 
     /// CID set last passed to setControlReporting. Diffed against next applyUsage's
@@ -1006,7 +1035,7 @@ class LogiDeviceSession {
     // MARK: - Setup / Teardown
 
     func setup() {
-        isBLE = transport.lowercased().contains("bluetooth")
+        isBLE = LogiSessionManager.isBluetoothTransport(transport)
 
         // 确定连接模式
         if isBLE {
@@ -1514,6 +1543,23 @@ class LogiDeviceSession {
         }
     }
 
+    static func canUseWakeProbeTarget(
+        connectionMode: ConnectionMode,
+        slot: UInt8,
+        managedSlots: Set<UInt8>,
+        receiverSweepActive: Bool,
+        hasPendingBLEUndivertGuardQueries: Bool
+    ) -> Bool {
+        switch connectionMode {
+        case .receiver:
+            return managedSlots.contains(slot) && !receiverSweepActive
+        case .bleDirect:
+            return slot == 0xFF && !hasPendingBLEUndivertGuardQueries
+        case .unsupported:
+            return false
+        }
+    }
+
     private func noteReceiverPeripheralReport(slot: UInt8, softwareID: UInt8) {
         // Only unsolicited peripheral activity can infer wake. Responses to our
         // own queries must never create another recovery cycle.
@@ -1521,8 +1567,14 @@ class LogiDeviceSession {
         let savedDeviceIndex = deviceIndex
         deviceIndex = slot
         defer { deviceIndex = savedDeviceIndex }
-        let canProbe = receiverManagedSlots.contains(slot) && reprogInitComplete
-            && !receiverSweepActive && !discoveryInFlight
+        let canProbe = Self.canUseWakeProbeTarget(
+            connectionMode: connectionMode,
+            slot: slot,
+            managedSlots: receiverManagedSlots,
+            receiverSweepActive: receiverSweepActive,
+            hasPendingBLEUndivertGuardQueries: !pendingBLEUndivertGuardQueries.isEmpty
+        ) && reprogInitComplete
+            && !discoveryInFlight
             && pendingDiscovery.isEmpty && controlInfoQueryTimer == nil
             && reportingQueryTimer == nil && featureIndex[Self.featureReprogV4] != nil
         let expected = canProbe ? receiverWakeExpectedCIDs : []
@@ -1546,7 +1598,7 @@ class LogiDeviceSession {
     }
 
     private func handleReceiverWakeProbeResponse(_ report: UnsafeBufferPointer<UInt8>) -> Bool {
-        guard connectionMode == .receiver, report.count >= 9,
+        guard (connectionMode == .receiver || connectionMode == .bleDirect), report.count >= 9,
               report[3] >> 4 == 2, report[3] & 0x0F >= 2 else { return false }
         let cid = (UInt16(report[4]) << 8) | UInt16(report[5])
         let slot = deviceIndex
@@ -1569,7 +1621,13 @@ class LogiDeviceSession {
         let savedDeviceIndex = deviceIndex
         deviceIndex = slot
         defer { deviceIndex = savedDeviceIndex }
-        let canRepair = receiverManagedSlots.contains(slot) && reprogInitComplete
+        let canRepair = Self.canUseWakeProbeTarget(
+            connectionMode: connectionMode,
+            slot: slot,
+            managedSlots: receiverManagedSlots,
+            receiverSweepActive: receiverSweepActive,
+            hasPendingBLEUndivertGuardQueries: !pendingBLEUndivertGuardQueries.isEmpty
+        ) && reprogInitComplete
             && currentReceiverTargetIsConnected && !discoveryInFlight
         let missing = receiverWakeRecovery[slot]?.finish(
             currentExpectedCIDs: canRepair ? receiverWakeExpectedCIDs : []
@@ -3413,6 +3471,10 @@ class LogiDeviceSession {
                     return
                 }
             }
+        } else if connectionMode == .bleDirect && featureIdx != Self.hidppErrorFeatureIdx {
+            // BLE 直连设备(如 M720 0xB015)在 GATT 保持连接下休眠唤醒时发 0x1D4B 等广播,
+            // 复用同一套有界读回修复, 仅在确认 tmpDivert 丢失时单次补写。
+            noteReceiverPeripheralReport(slot: deviceIndex, softwareID: report[3] & 0x0F)
         }
 
         // HID++ 2.0 Error report
@@ -3420,7 +3482,7 @@ class LogiDeviceSession {
             let originalFeatureIdx = report.count > 3 ? report[3] : 0
             let originalFuncId: UInt8 = report.count > 4 ? (report[4] >> 4) : 0
             let errorCode = report.count > 6 ? report[6] : 0
-            if connectionMode == .receiver, originalFuncId == 2,
+            if (connectionMode == .receiver || connectionMode == .bleDirect), originalFuncId == 2,
                report.count > 4, report[4] & 0x0F >= 2 {
                 LogiDebugPanel.log("[\(deviceInfo.name)] Wake readback failed; no repair authorized by this response")
                 return

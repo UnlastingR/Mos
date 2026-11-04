@@ -349,6 +349,51 @@ final class LogiReceiverConnectionStateTests: XCTestCase {
         XCTAssertEqual(recovery.noteActivity(at: 221, expectedCIDs: wakeBindings), wakeBindings)
     }
 
+    func testWakeProbeTargetSupportsBLEDirectAndManagedReceiverSlots() {
+        XCTAssertTrue(LogiDeviceSession.canUseWakeProbeTarget(
+            connectionMode: .bleDirect,
+            slot: 0xFF,
+            managedSlots: [],
+            receiverSweepActive: false,
+            hasPendingBLEUndivertGuardQueries: false
+        ))
+        XCTAssertFalse(LogiDeviceSession.canUseWakeProbeTarget(
+            connectionMode: .bleDirect,
+            slot: 0xFF,
+            managedSlots: [],
+            receiverSweepActive: false,
+            hasPendingBLEUndivertGuardQueries: true
+        ))
+        XCTAssertFalse(LogiDeviceSession.canUseWakeProbeTarget(
+            connectionMode: .bleDirect,
+            slot: 0x01,
+            managedSlots: [],
+            receiverSweepActive: false,
+            hasPendingBLEUndivertGuardQueries: false
+        ))
+        XCTAssertTrue(LogiDeviceSession.canUseWakeProbeTarget(
+            connectionMode: .receiver,
+            slot: 0x01,
+            managedSlots: [0x01],
+            receiverSweepActive: false,
+            hasPendingBLEUndivertGuardQueries: false
+        ))
+        XCTAssertFalse(LogiDeviceSession.canUseWakeProbeTarget(
+            connectionMode: .receiver,
+            slot: 0x01,
+            managedSlots: [0x01],
+            receiverSweepActive: true,
+            hasPendingBLEUndivertGuardQueries: false
+        ))
+        XCTAssertFalse(LogiDeviceSession.canUseWakeProbeTarget(
+            connectionMode: .unsupported,
+            slot: 0xFF,
+            managedSlots: [],
+            receiverSweepActive: false,
+            hasPendingBLEUndivertGuardQueries: false
+        ))
+    }
+
     // MARK: - receiverSlotConnectionAction (Phase 4 热插拔)
 
     func testSlotConnectionDisconnectedManagedReleases() {

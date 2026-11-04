@@ -13,6 +13,25 @@ import IOKit.hid
 /// Cycle direction for DPI / SmartShift toggle helpers.
 public enum Direction { case up, down }
 
+/// HID `DeviceUsagePairs` 单项 (`kIOHIDDeviceUsagePageKey` + `kIOHIDDeviceUsageKey`).
+struct LogiHIDUsagePair: Equatable, Hashable {
+    let usagePage: Int
+    let usage: Int
+
+    static func fromIOHIDProperty(_ rawProperty: Any?) -> [LogiHIDUsagePair] {
+        guard let entries = rawProperty as? [[String: Any]] else { return [] }
+        let pageKey = kIOHIDDeviceUsagePageKey as String
+        let usageKey = kIOHIDDeviceUsageKey as String
+        return entries.compactMap { entry in
+            guard let page = (entry[pageKey] as? NSNumber)?.intValue,
+                  let usage = (entry[usageKey] as? NSNumber)?.intValue else {
+                return nil
+            }
+            return LogiHIDUsagePair(usagePage: page, usage: usage)
+        }
+    }
+}
+
 /// Internal manager that orchestrates Logi HID device sessions. The only
 /// supported public surface is `LogiCenter` (Step 5's lint script enforces
 /// this against the rest of the app). Tests in `MosTests/Logi*Tests.swift`
@@ -111,6 +130,11 @@ internal class LogiSessionManager {
         let productName = IOHIDDeviceGetProperty(device, kIOHIDProductKey as CFString) as? String ?? "Unknown"
         let usagePage = IOHIDDeviceGetProperty(device, kIOHIDPrimaryUsagePageKey as CFString) as? Int ?? 0
         let usage = IOHIDDeviceGetProperty(device, kIOHIDPrimaryUsageKey as CFString) as? Int ?? 0
+        let transport = IOHIDDeviceGetProperty(device, kIOHIDTransportKey as CFString) as? String ?? ""
+        let isBLE = Self.isBluetoothTransport(transport)
+        let deviceUsagePairs = LogiHIDUsagePair.fromIOHIDProperty(
+            IOHIDDeviceGetProperty(device, kIOHIDDeviceUsagePairsKey as CFString)
+        )
 
         LogiDebugPanel.log("[LogitechHID] Device connected: \(productName) (VID: \(String(format: "0x%04X", vendorId)), PID: \(String(format: "0x%04X", productId)))")
 
@@ -120,7 +144,13 @@ internal class LogiSessionManager {
         // 键盘接口跳过: Mos 对键盘没有 HID++ 用途, 一旦创建会话会在接口上注册
         // input-report 回调, 使键盘无法进入休眠, 导致背光常亮 (issue #948)。
         // 不创建 LogiDeviceSession 即可完全不触碰该 HID 接口。
-        guard Self.shouldAttachSession(usagePage: usagePage, usage: usage) else {
+        guard Self.shouldAttachSession(
+            usagePage: usagePage,
+            usage: usage,
+            isBLE: isBLE,
+            productId: productId,
+            deviceUsagePairs: deviceUsagePairs
+        ) else {
             LogiDebugPanel.log("[LogitechHID] Skipping keyboard interface (keeps device awake): \(productName)")
             return
         }
@@ -132,16 +162,39 @@ internal class LogiSessionManager {
         NotificationCenter.default.post(name: Self.sessionChangedNotification, object: nil)
     }
 
+    static func isBluetoothTransport(_ transport: String) -> Bool {
+        return transport.lowercased().contains("bluetooth")
+    }
+
+    /// Logitech 蓝牙键盘 PID 段 (`0xB300...0xB3FF`, 如 K380/MX Keys/MX Mechanical)。
+    /// 部分复合蓝牙键盘描述符中可能附带模拟鼠标键的 Mouse collection,
+    /// 显式排除该段可确保 #948 的键盘休眠保护不被误放行。
+    static func isLogitechBLEKeyboardProductId(_ productId: Int) -> Bool {
+        return (0xB300...0xB3FF).contains(productId)
+    }
+
     /// 决定 Mos 是否应为某条 Logitech HID 接口创建会话。
     ///
-    /// 键盘接口 (Generic Desktop `0x0001` / Keyboard `0x0006`) 永远不是 HID++ 候选
-    /// (`isHIDPPCandidate` 已为 false), 但 `setup()` 仍会在非候选接口上注册
-    /// input-report 回调。该回调对键盘毫无用处 (`handleInputReport` 只处理
-    /// HID++ 报文 `0x10/0x11`, 键盘不发), 却会让键盘 HID 端点保持活跃, 使其
-    /// 无法休眠、背光常亮。因此对键盘接口整条跳过, 不创建会话。见 issue #948。
-    static func shouldAttachSession(usagePage: Int, usage: Int) -> Bool {
+    /// 纯键盘接口 (Generic Desktop `0x0001` / Keyboard `0x0006`) 永远不是 HID++ 候选,
+    /// 若创建会话并注册 input-report 回调会让键盘端点保持活跃、背光常亮 (issue #948)。
+    /// 但部分 BLE 鼠标 (如 M720 Triathlon `0xB015`、MX Master 2S `0xB019`、MX Anywhere 2S `0xB01A`)
+    /// 将板载快捷键的 Keyboard collection 排在 HID 描述符首位 (`PrimaryUsage = 1/6`),
+    /// 同时在同一条复合 BLE 接口上暴露 Mouse (`1/2`) 与 BLE HID++ (`0xFF43/0x0202`),
+    /// 这类复合 BLE 鼠标必须挂载会话。
+    static func shouldAttachSession(
+        usagePage: Int,
+        usage: Int,
+        isBLE: Bool = false,
+        productId: Int = 0,
+        deviceUsagePairs: [LogiHIDUsagePair] = []
+    ) -> Bool {
         // Generic Desktop (0x0001) Keyboard (0x0006)
-        if usagePage == 0x0001 && usage == 0x0006 { return false }
+        if usagePage == 0x0001 && usage == 0x0006 {
+            guard isBLE, !isLogitechBLEKeyboardProductId(productId) else {
+                return false
+            }
+            return deviceUsagePairs.contains(LogiHIDUsagePair(usagePage: 0x0001, usage: 0x0002))
+        }
         return true
     }
 

@@ -100,10 +100,10 @@ jobs:
           {
             echo 'Personal Mos test build'
             echo "Source commit: $BUILD_SHA"
-            echo 'Based on LJAYi PR #1012; replaces unconditional re-divert with guarded readback and one repair pass.'
+            echo 'Includes M720 BLE composite HID++ session support and guarded idle/wake divert repair.'
             echo 'Universal app for Apple silicon and Intel Macs.'
             echo 'Ad-hoc signed; not Apple-notarized.'
-            echo 'Real M720 idle/wake validation must be performed on a connected mouse.'
+            echo 'Real M720 BLE and idle/wake validation must be performed on a connected mouse.'
           } > artifacts/BUILD-INFO.txt
           {
             echo '### M720 wake-fix build'
