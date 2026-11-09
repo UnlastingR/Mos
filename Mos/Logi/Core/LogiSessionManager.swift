@@ -6,6 +6,7 @@
 //  Copyright © 2026 Caldis. All rights reserved.
 //
 
+import CoreGraphics
 import Foundation
 import IOKit
 import IOKit.hid
@@ -43,17 +44,41 @@ internal class LogiSessionManager {
     // MARK: - Constants
     static let logitechVendorId: Int = 0x046D
     static let buttonEventNotification = NSNotification.Name("LogiButtonEvent")
+    private static let screenIsLockedNotification = Notification.Name("com.apple.screenIsLocked")
+    private static let screenIsUnlockedNotification = Notification.Name("com.apple.screenIsUnlocked")
+    private static let unlockRecoveryDelay: TimeInterval = 0.35
+    private static let maxUnlockSettlePolls = 4
+    private static let permissionRetryDelays: [TimeInterval] = [0.5, 1.5, 3.0]
+    private static let lazyActivityRecoveryCooldown: TimeInterval = 3.0
+    private static let maxLazyActivityRecoveryAttempts = 2
+
+    enum UnlockRecoveryAction: Equatable {
+        case none
+        case restartManager
+        case probeActiveSessions
+    }
 
     // MARK: - State
     private var hidManager: IOHIDManager?
     private var sessions: [IOHIDDevice: LogiDeviceSession] = [:]
     private(set) var isActive = false
     private let deliveryModes = LogiButtonDeliveryModeStore()
+    private var systemObserversInstalled = false
+    private var screenLockObserved = false
+    private var unlockRecoveryWorkItem: DispatchWorkItem?
+    private var unlockSettlePollCount = 0
+    private var permissionRetryWorkItem: DispatchWorkItem?
+    private var permissionRetryCount = 0
+    private var lazyActivityRecoveryCount = 0
+    private var lastLazyActivityRecoveryTime: TimeInterval = 0
+    private var isRestartingForRecovery = false
 
     // MARK: - Lifecycle
 
     func start() {
         guard !isActive else { return }
+        installSystemObserversIfNeeded()
+        screenLockObserved = Self.queryScreenLocked()
         LogiDebugPanel.log("[LogitechHID] Starting")
 
         hidManager = IOHIDManagerCreate(kCFAllocatorDefault, IOOptionBits(kIOHIDOptionsTypeNone))
@@ -76,19 +101,34 @@ internal class LogiSessionManager {
         // Schedule 到 main RunLoop (HID++ 事件低频, 避免线程同步)
         IOHIDManagerScheduleWithRunLoop(manager, CFRunLoopGetMain(), CFRunLoopMode.commonModes.rawValue)
 
+        isActive = true
         let result = IOHIDManagerOpen(manager, IOOptionBits(kIOHIDOptionsTypeNone))
         if result != kIOReturnSuccess {
+            isActive = false
+            IOHIDManagerUnscheduleFromRunLoop(manager, CFRunLoopGetMain(), CFRunLoopMode.commonModes.rawValue)
+            hidManager = nil
             LogiDebugPanel.log("[LogitechHID] Failed to open IOHIDManager: \(String(format: "0x%08x", result))")
             return
         }
 
-        isActive = true
         LogiDebugPanel.log("[LogitechHID] Started")
     }
 
     func stop() {
         guard isActive else { return }
         LogiDebugPanel.log("[LogitechHID] Stopping")
+
+        if !isRestartingForRecovery {
+            unlockRecoveryWorkItem?.cancel()
+            unlockRecoveryWorkItem = nil
+            unlockSettlePollCount = 0
+            permissionRetryWorkItem?.cancel()
+            permissionRetryWorkItem = nil
+            permissionRetryCount = 0
+            lazyActivityRecoveryCount = 0
+            lastLazyActivityRecoveryTime = 0
+            deliveryModes.resetAll()
+        }
 
         // 清理所有设备会话
         for (_, session) in sessions {
@@ -105,6 +145,207 @@ internal class LogiSessionManager {
         // sessions 被清空后重算一次, 把 lastKnownBusy 归位并让 UI 同步关闭 spinner.
         recomputeAndNotifyActivityState()
         LogiDebugPanel.log("[LogitechHID] Stopped")
+    }
+
+    // MARK: - Screen Lock & Permission-Denied Session Recovery
+
+    static func queryScreenLocked() -> Bool {
+        guard let dict = CGSessionCopyCurrentDictionary() as? [String: Any] else {
+            return false
+        }
+        return (dict["CGSSessionScreenIsLocked"] as? Bool) ?? false
+    }
+
+    var isScreenLocked: Bool {
+        return screenLockObserved || Self.queryScreenLocked()
+    }
+
+    static func unlockRecoveryAction(
+        isActive: Bool,
+        hasCandidateSessions: Bool,
+        anySessionNeedsReopen: Bool,
+        anyCandidateIncomplete: Bool
+    ) -> UnlockRecoveryAction {
+        guard isActive, hasCandidateSessions else { return .none }
+        if anySessionNeedsReopen || anyCandidateIncomplete {
+            return .restartManager
+        }
+        return .probeActiveSessions
+    }
+
+    static func nextPermissionRetryDelay(completedAttempts: Int) -> TimeInterval? {
+        guard completedAttempts >= 0, completedAttempts < permissionRetryDelays.count else {
+            return nil
+        }
+        return permissionRetryDelays[completedAttempts]
+    }
+
+    static func canAttemptLazyActivityRecovery(
+        isScreenLocked: Bool,
+        completedAttempts: Int,
+        now: TimeInterval,
+        lastAttemptTime: TimeInterval
+    ) -> Bool {
+        guard !isScreenLocked,
+              completedAttempts < maxLazyActivityRecoveryAttempts,
+              lastAttemptTime == 0 || (now - lastAttemptTime) >= lazyActivityRecoveryCooldown else {
+            return false
+        }
+        return true
+    }
+
+    private func installSystemObserversIfNeeded() {
+        guard !systemObserversInstalled else { return }
+        systemObserversInstalled = true
+        let dnc = DistributedNotificationCenter.default()
+        dnc.addObserver(
+            forName: Self.screenIsLockedNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.handleScreenLocked()
+        }
+        dnc.addObserver(
+            forName: Self.screenIsUnlockedNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.handleScreenUnlocked()
+        }
+    }
+
+    private func handleScreenLocked() {
+        screenLockObserved = true
+        unlockRecoveryWorkItem?.cancel()
+        unlockRecoveryWorkItem = nil
+        unlockSettlePollCount = 0
+        permissionRetryWorkItem?.cancel()
+        permissionRetryWorkItem = nil
+        LogiDebugPanel.log("[LogitechHID] Screen locked")
+    }
+
+    private func handleScreenUnlocked() {
+        screenLockObserved = false
+        unlockSettlePollCount = 0
+        permissionRetryCount = 0
+        lazyActivityRecoveryCount = 0
+        lastLazyActivityRecoveryTime = 0
+        permissionRetryWorkItem?.cancel()
+        permissionRetryWorkItem = nil
+        guard isActive else { return }
+        LogiDebugPanel.log("[LogitechHID] Screen unlocked; scheduling session verification")
+        scheduleUnlockRecovery(delay: Self.unlockRecoveryDelay)
+    }
+
+    private func scheduleUnlockRecovery(delay: TimeInterval) {
+        unlockRecoveryWorkItem?.cancel()
+        let item = DispatchWorkItem { [weak self] in
+            guard let self = self else { return }
+            self.unlockRecoveryWorkItem = nil
+            self.performUnlockRecovery()
+        }
+        unlockRecoveryWorkItem = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: item)
+    }
+
+    private func performUnlockRecovery() {
+        guard isActive, !screenLockObserved else { return }
+        if Self.queryScreenLocked(), unlockSettlePollCount < Self.maxUnlockSettlePolls {
+            unlockSettlePollCount += 1
+            scheduleUnlockRecovery(delay: Self.unlockRecoveryDelay)
+            return
+        }
+        unlockSettlePollCount = 0
+
+        let candidates = sessions.values.filter { $0.isHIDPPCandidate }
+        let anyNeedsReopen = candidates.contains { $0.needsSessionReopen }
+        let anyIncomplete = candidates.contains { $0.needsPostSleepHandshakeRecovery }
+        let action = Self.unlockRecoveryAction(
+            isActive: isActive,
+            hasCandidateSessions: !candidates.isEmpty,
+            anySessionNeedsReopen: anyNeedsReopen,
+            anyCandidateIncomplete: anyIncomplete
+        )
+        switch action {
+        case .none:
+            break
+        case .restartManager:
+            restartManagerForRecovery(reason: "screen unlocked with blocked or incomplete HID++ session")
+        case .probeActiveSessions:
+            for session in candidates {
+                session.triggerImmediateWakeProbe(reason: "screen unlocked")
+            }
+        }
+    }
+
+    func noteSessionPermissionDenied(_ session: LogiDeviceSession, ioreturn: IOReturn) {
+        guard isActive else { return }
+        if isScreenLocked {
+            LogiDebugPanel.log(
+                "[LogitechHID] \(session.deviceInfo.name) setReport denied (\(String(format: "0x%08x", ioreturn))) while screen locked; waiting for unlock"
+            )
+            return
+        }
+        guard permissionRetryWorkItem == nil,
+              let delay = Self.nextPermissionRetryDelay(completedAttempts: permissionRetryCount) else {
+            return
+        }
+        permissionRetryCount += 1
+        let attempt = permissionRetryCount
+        LogiDebugPanel.log(
+            "[LogitechHID] \(session.deviceInfo.name) setReport denied (\(String(format: "0x%08x", ioreturn))); scheduling session reopen #\(attempt) in \(String(format: "%.1fs", delay))"
+        )
+        let item = DispatchWorkItem { [weak self] in
+            guard let self = self else { return }
+            self.permissionRetryWorkItem = nil
+            guard self.isActive, !self.isScreenLocked else { return }
+            guard self.sessions.values.contains(where: { $0.needsSessionReopen }) else { return }
+            self.restartManagerForRecovery(reason: "HID setReport permission retry #\(attempt)")
+        }
+        permissionRetryWorkItem = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: item)
+    }
+
+    func noteSessionActivityWhileBlocked(_ session: LogiDeviceSession, at now: TimeInterval) {
+        guard isActive,
+              unlockRecoveryWorkItem == nil,
+              permissionRetryWorkItem == nil,
+              Self.canAttemptLazyActivityRecovery(
+                  isScreenLocked: isScreenLocked,
+                  completedAttempts: lazyActivityRecoveryCount,
+                  now: now,
+                  lastAttemptTime: lastLazyActivityRecoveryTime
+              ) else {
+            return
+        }
+        lazyActivityRecoveryCount += 1
+        lastLazyActivityRecoveryTime = now
+        let attempt = lazyActivityRecoveryCount
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self, self.isActive, !self.isScreenLocked else { return }
+            guard self.sessions.values.contains(where: { $0.needsSessionReopen }) else { return }
+            self.restartManagerForRecovery(reason: "post-denial input activity #\(attempt)")
+        }
+    }
+
+    func noteSessionSendSucceeded() {
+        guard !sessions.values.contains(where: { $0.needsSessionReopen }) else { return }
+        permissionRetryCount = 0
+        lazyActivityRecoveryCount = 0
+        lastLazyActivityRecoveryTime = 0
+    }
+
+    private func restartManagerForRecovery(reason: String) {
+        guard isActive else { return }
+        let preserveRecording = isRecording
+        LogiDebugPanel.log("[LogitechHID] Restarting IOHIDManager (\(reason))")
+        isRestartingForRecovery = true
+        defer { isRestartingForRecovery = false }
+        stop()
+        start()
+        if preserveRecording {
+            temporarilyDivertAll()
+        }
     }
 
     // MARK: - Device Callbacks (C function pointers)

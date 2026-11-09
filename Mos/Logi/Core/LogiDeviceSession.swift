@@ -50,6 +50,31 @@ struct LogiReceiverWakeRecovery {
     private(set) var pendingCIDs: Set<UInt16> = []
     private var missingCIDs: Set<UInt16> = []
 
+    /// Seed initial activity timestamp when divert finishes so the very first
+    /// wake event after an idle period is not swallowed by `lastActivityTime == nil`.
+    mutating func seedActivity(at time: TimeInterval) {
+        if lastActivityTime == nil {
+            lastActivityTime = time
+        }
+    }
+
+    /// Refresh activity timestamp during continuous non-HID++ input (e.g. BLE mouse
+    /// movement) without starting a probe.
+    mutating func touchActivity(at time: TimeInterval) {
+        lastActivityTime = time
+    }
+
+    /// Explicitly start a single bounded readback batch (e.g. after screen unlock)
+    /// regardless of elapsed idle duration, unless a batch is already in flight.
+    mutating func beginForcedProbe(at time: TimeInterval, expectedCIDs: Set<UInt16>) -> Set<UInt16> {
+        lastActivityTime = time
+        guard pendingCIDs.isEmpty, !expectedCIDs.isEmpty else { return [] }
+        softwareID = softwareID == 0x0F ? 2 : softwareID + 1
+        pendingCIDs = expectedCIDs
+        missingCIDs.removeAll()
+        return expectedCIDs
+    }
+
     mutating func noteActivity(at time: TimeInterval, expectedCIDs: Set<UInt16>) -> Set<UInt16> {
         defer { lastActivityTime = time }
         guard let previous = lastActivityTime,
@@ -174,7 +199,19 @@ class LogiDeviceSession {
     private var pendingDiscovery: [UInt16: (UInt8?) -> Void] = [:]
     private var discoveryTimer: Timer?
     private static let discoveryTimeout: TimeInterval = 5.0
+    private static let cacheValidationTimeout: TimeInterval = 1.5
     private var pendingCacheValidation: UInt8? = nil  // 等待 ping 响应验证缓存
+
+    // MARK: - Lock Screen / Permission-Denied Recovery & BLE Idle Tracking
+    private(set) var needsSessionReopen: Bool = false
+    private var isTearingDown: Bool = false
+    private var reprogFeatureUnsupported: Bool = false
+    private var bleIncompleteRediscoveryCount: Int = 0
+    private var lastBLEIncompleteRediscoveryTime: TimeInterval = 0
+    private static let bleIncompleteRediscoveryCooldown: TimeInterval = 5.0
+    private static let maxBLEIncompleteRediscoveryAttempts: Int = 2
+    private var lastBLEInputTimestamp: TimeInterval = 0
+    private var lastBLEWakeSyncTimestamp: TimeInterval = 0
 
     // MARK: - Query Timeouts (防止 Bolt receiver 上 HID++ 响应丢包 / 错误导致 query 链路卡死)
     private var controlInfoQueryTimer: Timer?
@@ -194,6 +231,7 @@ class LogiDeviceSession {
         var reprogControlCount: Int = 0
         var reprogQueryIndex: Int = 0
         var reportingQueryIndex: Int = 0      // GetControlReporting 逐按键查询进度
+        var controlCountRetryCount: Int = 0
         var controlInfoRetryCounts: [Int: Int] = [:]
         var lastApplied: Set<UInt16> = []     // divert 对账缓存: 上次下发的 divert 目标集
         // 按键按下/抬起状态跟踪: 必须按 slot 独立, 否则同型号两只鼠标 (CID 相同) 的
@@ -235,6 +273,10 @@ class LogiDeviceSession {
     private var reportingQueryIndex: Int {
         get { slotStates[deviceIndex]?.reportingQueryIndex ?? 0 }
         set { slotStates[deviceIndex, default: PerSlotState()].reportingQueryIndex = newValue }
+    }
+    private var controlCountRetryCount: Int {
+        get { slotStates[deviceIndex]?.controlCountRetryCount ?? 0 }
+        set { slotStates[deviceIndex, default: PerSlotState()].controlCountRetryCount = newValue }
     }
     private var controlInfoRetryCounts: [Int: Int] {
         get { slotStates[deviceIndex]?.controlInfoRetryCounts ?? [:] }
@@ -1070,6 +1112,12 @@ class LogiDeviceSession {
 
         setupInputReportCallback()
 
+        if Self.requiresUnlockedKeyboardClient(usagePage: usagePage, usage: usage),
+           LogiSessionManager.shared.isScreenLocked {
+            needsSessionReopen = true
+            LogiDebugPanel.log("\(tag) Composite keyboard-primary HID session opened while screen locked; flagged for post-unlock reopen")
+        }
+
         // 标记初次 discovery 开始 (覆盖 receiver enumeration + BLE direct discovery + 缓存验证),
         // UI 打开 debug panel 时能看到 Initializing spinner.
         setDiscoveryInFlight(true)
@@ -1087,11 +1135,28 @@ class LogiDeviceSession {
             LogiDebugPanel.log("\(tag) Using cached feature index: REPROG at 0x\(String(format: "%02X", reprogIdx))")
             self.featureIndex = cached.reduce(into: [UInt16: UInt8]()) { $0[$1.key] = $1.value }
             // 用 ping 验证缓存是否有效 (IRoot.GetProtocolVersion)
-            sendRequest(featureIndex: 0x00, functionId: 1)
             pendingCacheValidation = reprogIdx
+            let status = sendRequest(featureIndex: 0x00, functionId: 1)
+            guard !Self.isPermissionDeniedIOReturn(status) else {
+                pendingCacheValidation = nil
+                return
+            }
+            scheduleCacheValidationTimeout(tag: tag)
         } else {
             LogiDebugPanel.log("\(tag) Starting feature discovery for REPROG_CONTROLS_V4 (0x1B04)")
             startFreshDiscovery(tag: tag)
+        }
+    }
+
+    private func scheduleCacheValidationTimeout(tag: String) {
+        discoveryTimer?.invalidate()
+        discoveryTimer = Timer.scheduledTimer(withTimeInterval: Self.cacheValidationTimeout, repeats: false) { [weak self] _ in
+            guard let self = self else { return }
+            self.discoveryTimer = nil
+            guard self.pendingCacheValidation != nil else { return }
+            self.pendingCacheValidation = nil
+            LogiDebugPanel.log("\(tag) Cache validation ping timed out; falling back to feature discovery")
+            self.startFreshDiscovery(tag: tag)
         }
     }
 
@@ -1105,6 +1170,7 @@ class LogiDeviceSession {
     }
 
     func teardown() {
+        isTearingDown = true
         LogiDebugPanel.log("[\(deviceInfo.name)] Teardown")
         pendingInitialTargetSelection = false
         pendingDeviceInfoSlots.removeAll()
@@ -1124,11 +1190,13 @@ class LogiDeviceSession {
         reportingQueryTimer?.invalidate()
         reportingQueryTimer = nil
         pendingDiscovery.removeAll()
+        pendingCacheValidation = nil
+        controlCountRetryCount = 0
         controlInfoRetryCounts.removeAll()
         cancelDivertReassertion()
         cancelBLEStandardUndivertGuard()
         releaseAllActiveButtonState(reason: "teardown")
-        if let reprogIdx = featureIndex[Self.featureReprogV4] {
+        if !needsSessionReopen, let reprogIdx = featureIndex[Self.featureReprogV4] {
             for cid in divertedCIDs {
                 setControlReporting(featureIndex: reprogIdx, cid: cid, divert: false)
             }
@@ -1152,12 +1220,70 @@ class LogiDeviceSession {
         session.handleInputReport(buffer)
     }
 
-    // MARK: - HID++ Send
+    // MARK: - HID++ Send & Permission Helpers
+
+    /// Monotonic timestamp (seconds) that keeps advancing across macOS system sleep.
+    static func continuousTimestamp() -> TimeInterval {
+        return Double(clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW)) / 1_000_000_000.0
+    }
+
+    static func isPermissionDeniedIOReturn(_ result: IOReturn) -> Bool {
+        return result == kIOReturnNotPermitted || result == kIOReturnNotPrivileged
+    }
+
+    static func requiresUnlockedKeyboardClient(usagePage: Int, usage: Int) -> Bool {
+        return usagePage == 0x0001 && usage == 0x0006
+    }
+
+    static func shouldRecoverIncompleteCandidateSession(
+        connectionMode: ConnectionMode,
+        handshakeComplete: Bool,
+        reprogInitComplete: Bool,
+        reprogFeatureUnsupported: Bool
+    ) -> Bool {
+        if !handshakeComplete { return true }
+        if connectionMode == .bleDirect && !reprogInitComplete && !reprogFeatureUnsupported {
+            return true
+        }
+        return false
+    }
+
+    var needsPostSleepHandshakeRecovery: Bool {
+        return Self.shouldRecoverIncompleteCandidateSession(
+            connectionMode: connectionMode,
+            handshakeComplete: handshakeComplete,
+            reprogInitComplete: reprogInitComplete,
+            reprogFeatureUnsupported: reprogFeatureUnsupported
+        )
+    }
+
+    private func recordIOReturnStatus(_ result: IOReturn, context: String) {
+        guard !isTearingDown else { return }
+        if result == kIOReturnSuccess {
+            if !needsSessionReopen {
+                LogiSessionManager.shared.noteSessionSendSucceeded()
+            }
+            return
+        }
+        guard Self.isPermissionDeniedIOReturn(result) else { return }
+        needsSessionReopen = true
+        if discoveryInFlight {
+            cancelInflightDiscovery()
+            setDiscoveryInFlight(false)
+        }
+        LogiDebugPanel.log(
+            device: deviceInfo.name,
+            type: .warning,
+            message: "HID setReport denied (\(String(format: "0x%08x", result))) during \(context); session marked for reopen"
+        )
+        LogiSessionManager.shared.noteSessionPermissionDenied(self, ioreturn: result)
+    }
 
     /// 发送 HID++ 请求
     /// BLE 直连: long report (20 bytes) + report ID in payload (hidapi 兼容)
     /// Receiver: TODO - 可能需要不同格式, 待 Bolt/Unifying 测试后实现
-    private func sendRequest(featureIndex: UInt8, functionId: UInt8, params: [UInt8] = [], softwareID: UInt8 = 1) {
+    @discardableResult
+    private func sendRequest(featureIndex: UInt8, functionId: UInt8, params: [UInt8] = [], softwareID: UInt8 = 1) -> IOReturn {
         var report: [UInt8]
         let result: IOReturn
 
@@ -1192,13 +1318,15 @@ class LogiDeviceSession {
 
         case .unsupported:
             LogiDebugPanel.log(device: deviceInfo.name, type: .warning, message: "Cannot send: unsupported connection mode")
-            return
+            return kIOReturnUnsupported
         }
 
         let hex = report.prefix(8).map { String(format: "%02X", $0) }.joined(separator: " ")
         let resultStr = result == kIOReturnSuccess ? "OK" : String(format: "0x%08x", result)
         let decoded = decodeRequest(featureIndex: featureIndex, functionId: functionId, params: params)
         LogiDebugPanel.log(device: deviceInfo.name, type: .tx, message: "TX: \(hex)... -> \(resultStr)", decoded: decoded)
+        recordIOReturnStatus(result, context: decoded)
+        return result
     }
 
     // MARK: - Feature Discovery
@@ -1216,6 +1344,7 @@ class LogiDeviceSession {
                 self.receiverSlotDiscoveryDidFinish(didDivert: false)
                 return
             }
+            self.reprogFeatureUnsupported = false
             self.featureIndex[Self.featureReprogV4] = index
             LogiDebugPanel.log("\(tag) REPROG_CONTROLS_V4 at index \(String(format: "0x%02X", index))")
             // 缓存 feature index
@@ -1273,7 +1402,8 @@ class LogiDeviceSession {
 
     private func discoverFeature(featureId: UInt16, completion: @escaping (UInt8?) -> Void) {
         let params: [UInt8] = [UInt8(featureId >> 8), UInt8(featureId & 0xFF)]
-        sendRequest(featureIndex: 0x00, functionId: 0, params: params)
+        let status = sendRequest(featureIndex: 0x00, functionId: 0, params: params)
+        guard !Self.isPermissionDeniedIOReturn(status) else { return }
         pendingDiscovery[featureId] = completion
 
         discoveryTimer?.invalidate()
@@ -1291,12 +1421,41 @@ class LogiDeviceSession {
 
     private func sendGetControlCount(featureIndex: UInt8) {
         LogiDebugPanel.log("[\(deviceInfo.name)] Sending GetControlCount")
-        sendRequest(featureIndex: featureIndex, functionId: 0)
+        let status = sendRequest(featureIndex: featureIndex, functionId: 0)
+        guard !Self.isPermissionDeniedIOReturn(status) else { return }
+        scheduleControlCountTimeout(featureIndex: featureIndex)
+    }
+
+    private func scheduleControlCountTimeout(featureIndex: UInt8) {
+        controlInfoQueryTimer?.invalidate()
+        controlInfoQueryTimer = Timer.scheduledTimer(withTimeInterval: Self.reprogQueryTimeout, repeats: false) { [weak self] _ in
+            guard let self = self else { return }
+            self.controlInfoQueryTimer = nil
+            let retryCount = self.controlCountRetryCount
+            if Self.shouldRetryControlInfoTimeout(
+                connectionMode: self.connectionMode,
+                retryCount: retryCount
+            ) {
+                self.controlCountRetryCount = retryCount + 1
+                LogiDebugPanel.log(
+                    "[\(self.deviceInfo.name)] GetControlCount timed out, retrying (\(retryCount + 1)/\(Self.bleControlInfoRetryLimit))"
+                )
+                self.sendGetControlCount(featureIndex: featureIndex)
+                return
+            }
+            self.controlCountRetryCount = 0
+            LogiDebugPanel.log("[\(self.deviceInfo.name)] GetControlCount timed out; completing handshake without controls")
+            self.markHandshakeComplete()
+            NotificationCenter.default.post(name: LogiSessionManager.reportingQueryDidCompleteNotification, object: nil)
+            LogiSessionManager.shared.recomputeAndNotifyActivityState()
+            self.receiverSlotDiscoveryDidFinish(didDivert: false)
+        }
     }
 
     private func sendGetControlInfo(featureIndex: UInt8, index: Int) {
         LogiDebugPanel.log("[\(deviceInfo.name)] Sending GetControlInfo(\(index))")
-        sendRequest(featureIndex: featureIndex, functionId: 1, params: [UInt8(index)])
+        let status = sendRequest(featureIndex: featureIndex, functionId: 1, params: [UInt8(index)])
+        guard !Self.isPermissionDeniedIOReturn(status) else { return }
         scheduleControlInfoTimeout(index: index)
     }
 
@@ -1468,6 +1627,7 @@ class LogiDeviceSession {
     func rediscoverFeatures() {
         cancelInflightDiscovery()
         featureIndex.removeAll()
+        reprogFeatureUnsupported = false
         resetOptionalProbeState()
         resetHapticDiscoveryState()
         resetScrollForceDiscoveryState()
@@ -1478,6 +1638,7 @@ class LogiDeviceSession {
         reprogControlCount = 0
         reprogQueryIndex = 0
         reportingQueryIndex = 0
+        controlCountRetryCount = 0
         controlInfoRetryCounts.removeAll()
         releaseAllActiveButtonState(reason: "rediscover")
         lastApplied.removeAll()
@@ -1501,6 +1662,7 @@ class LogiDeviceSession {
         reportingQueryTimer?.invalidate(); reportingQueryTimer = nil
         pendingDiscovery.removeAll()
         pendingCacheValidation = nil
+        controlCountRetryCount = 0
         controlInfoRetryCounts.removeAll()
         cancelDivertReassertion()
         cancelBLEStandardUndivertGuard()
@@ -1533,7 +1695,16 @@ class LogiDeviceSession {
         divertedCIDs.removeAll()
         lastApplied.removeAll()
         primeFromRegistry()
+        seedWakeRecoveryActivity(slot: deviceIndex, at: Self.continuousTimestamp())
         LogiDebugPanel.log("[\(deviceInfo.name)] Re-synced divert with bindings")
+    }
+
+    private func seedWakeRecoveryActivity(slot: UInt8, at now: TimeInterval) {
+        receiverWakeRecovery[slot, default: LogiReceiverWakeRecovery()].seedActivity(at: now)
+        if connectionMode == .bleDirect {
+            lastBLEInputTimestamp = now
+            lastBLEWakeSyncTimestamp = now
+        }
     }
 
     private var receiverWakeExpectedCIDs: Set<UInt16> {
@@ -1560,14 +1731,8 @@ class LogiDeviceSession {
         }
     }
 
-    private func noteReceiverPeripheralReport(slot: UInt8, softwareID: UInt8) {
-        // Only unsolicited peripheral activity can infer wake. Responses to our
-        // own queries must never create another recovery cycle.
-        guard softwareID == 0 else { return }
-        let savedDeviceIndex = deviceIndex
-        deviceIndex = slot
-        defer { deviceIndex = savedDeviceIndex }
-        let canProbe = Self.canUseWakeProbeTarget(
+    private func canStartWakeProbe(forSlot slot: UInt8) -> Bool {
+        return Self.canUseWakeProbeTarget(
             connectionMode: connectionMode,
             slot: slot,
             managedSlots: receiverManagedSlots,
@@ -1577,13 +1742,12 @@ class LogiDeviceSession {
             && !discoveryInFlight
             && pendingDiscovery.isEmpty && controlInfoQueryTimer == nil
             && reportingQueryTimer == nil && featureIndex[Self.featureReprogV4] != nil
-        let expected = canProbe ? receiverWakeExpectedCIDs : []
-        let cids = receiverWakeRecovery[slot, default: LogiReceiverWakeRecovery()].noteActivity(
-            at: ProcessInfo.processInfo.systemUptime, expectedCIDs: expected
-        )
-        guard !cids.isEmpty, let idx = featureIndex[Self.featureReprogV4] else { return }
-        let token = receiverWakeRecovery[slot]!.softwareID
-        LogiDebugPanel.log("[\(deviceInfo.name)] Slot \(slot) activity after idle; probing \(cids.count) bound controls once")
+    }
+
+    private func dispatchWakeProbeBatch(slot: UInt8, cids: Set<UInt16>, reason: String) {
+        guard !cids.isEmpty, let idx = featureIndex[Self.featureReprogV4],
+              let token = receiverWakeRecovery[slot]?.softwareID else { return }
+        LogiDebugPanel.log("[\(deviceInfo.name)] Slot \(slot) \(reason); probing \(cids.count) bound controls once")
         let timeout = DispatchWorkItem { [weak self] in
             guard let self = self, self.receiverWakeRecovery[slot]?.softwareID == token else { return }
             self.finishReceiverWakeProbe(slot: slot)
@@ -1592,8 +1756,77 @@ class LogiDeviceSession {
         receiverWakeProbeTimeouts[slot] = timeout
         DispatchQueue.main.asyncAfter(deadline: .now() + 2.0, execute: timeout)
         for cid in cids.sorted() {
-            sendRequest(featureIndex: idx, functionId: 2,
-                        params: [UInt8(cid >> 8), UInt8(cid & 0xFF)], softwareID: token)
+            let status = sendRequest(
+                featureIndex: idx,
+                functionId: 2,
+                params: [UInt8(cid >> 8), UInt8(cid & 0xFF)],
+                softwareID: token
+            )
+            if Self.isPermissionDeniedIOReturn(status) {
+                cancelReceiverWakeProbe(slot: slot)
+                return
+            }
+        }
+    }
+
+    private func noteReceiverPeripheralReport(
+        slot: UInt8,
+        softwareID: UInt8,
+        timestamp: TimeInterval = LogiDeviceSession.continuousTimestamp()
+    ) {
+        // Only unsolicited peripheral activity can infer wake. Responses to our
+        // own queries must never create another recovery cycle.
+        guard softwareID == 0 else { return }
+        if connectionMode == .bleDirect {
+            lastBLEInputTimestamp = timestamp
+            lastBLEWakeSyncTimestamp = timestamp
+        }
+        let savedDeviceIndex = deviceIndex
+        deviceIndex = slot
+        defer { deviceIndex = savedDeviceIndex }
+        let expected = canStartWakeProbe(forSlot: slot) ? receiverWakeExpectedCIDs : []
+        let cids = receiverWakeRecovery[slot, default: LogiReceiverWakeRecovery()].noteActivity(
+            at: timestamp, expectedCIDs: expected
+        )
+        dispatchWakeProbeBatch(slot: slot, cids: cids, reason: "activity after idle")
+    }
+
+    /// Trigger a single bounded readback probe across active target slots (e.g. right
+    /// after screen unlock) so lost temporary diverts or a revoked IOHIDLibUserClient
+    /// are detected and repaired immediately.
+    func triggerImmediateWakeProbe(reason: String) {
+        guard isHIDPPCandidate, !discoveryInFlight else { return }
+        let now = Self.continuousTimestamp()
+        let slots: [UInt8]
+        switch connectionMode {
+        case .bleDirect:
+            slots = [0xFF]
+        case .receiver:
+            slots = receiverManagedSlots.sorted()
+        case .unsupported:
+            return
+        }
+        if connectionMode == .bleDirect {
+            lastBLEInputTimestamp = now
+            lastBLEWakeSyncTimestamp = now
+        }
+        let savedDeviceIndex = deviceIndex
+        defer { deviceIndex = savedDeviceIndex }
+        for slot in slots {
+            deviceIndex = slot
+            guard canStartWakeProbe(forSlot: slot) else { continue }
+            let expected = receiverWakeExpectedCIDs
+            if expected.isEmpty {
+                if connectionMode == .bleDirect,
+                   Self.requiresUnlockedKeyboardClient(usagePage: usagePage, usage: usage) {
+                    sendRequest(featureIndex: 0x00, functionId: 1)
+                }
+                continue
+            }
+            let cids = receiverWakeRecovery[slot, default: LogiReceiverWakeRecovery()].beginForcedProbe(
+                at: now, expectedCIDs: expected
+            )
+            dispatchWakeProbeBatch(slot: slot, cids: cids, reason: reason)
         }
     }
 
@@ -1809,6 +2042,7 @@ class LogiDeviceSession {
         let resultStr = result == kIOReturnSuccess ? "OK" : String(format: "0x%08x", result)
         LogiDebugPanel.log(device: deviceInfo.name, type: .tx, message: "TX: \(hex) -> \(resultStr)",
                                   decoded: "IRoot.Ping(slot=\(slot))")
+        recordIOReturnStatus(result, context: "IRoot.Ping(slot=\(slot))")
     }
 
     /// 查询 receiver slot 的设备信息 (register 0xB5)
@@ -1860,6 +2094,7 @@ class LogiDeviceSession {
         let paramsHex = params.map { String(format: "%02X", $0) }.joined(separator: " ")
         LogiDebugPanel.log(device: deviceInfo.name, type: .tx, message: "TX: \(hex) -> \(resultStr)",
                                   decoded: "\(isLong ? "GET_LONG" : "GET")_REGISTER(\(regName), [\(paramsHex)])")
+        recordIOReturnStatus(result, context: "GET_REGISTER(\(regName))")
     }
 
     // MARK: - Receiver Response Handlers
@@ -2018,6 +2253,7 @@ class LogiDeviceSession {
         reprogControlCount = 0
         reprogQueryIndex = 0
         reportingQueryIndex = 0
+        controlCountRetryCount = 0
         controlInfoRetryCounts.removeAll()
         setDiscoveryInFlight(true)
         let selected = receiverPairedDevices.first(where: { $0.slot == slot })
@@ -3397,7 +3633,39 @@ class LogiDeviceSession {
         }
     }
 
+    private func recordBLEDirectStandardInputReport(at now: TimeInterval) {
+        let previous = lastBLEInputTimestamp
+        lastBLEInputTimestamp = now
+        if needsPostSleepHandshakeRecovery,
+           !discoveryInFlight,
+           !needsSessionReopen,
+           bleIncompleteRediscoveryCount < Self.maxBLEIncompleteRediscoveryAttempts,
+           lastBLEIncompleteRediscoveryTime == 0 || (now - lastBLEIncompleteRediscoveryTime) >= Self.bleIncompleteRediscoveryCooldown {
+            bleIncompleteRediscoveryCount += 1
+            lastBLEIncompleteRediscoveryTime = now
+            LogiDebugPanel.log("[\(deviceInfo.name)] BLE input received on incomplete session; retrying discovery (#\(bleIncompleteRediscoveryCount))")
+            rediscoverFeatures()
+            return
+        }
+        if previous > 0, now - previous >= LogiReceiverWakeRecovery.idleThreshold {
+            noteReceiverPeripheralReport(slot: deviceIndex, softwareID: 0, timestamp: now)
+        } else if now - lastBLEWakeSyncTimestamp >= 1.0 {
+            lastBLEWakeSyncTimestamp = now
+            receiverWakeRecovery[deviceIndex, default: LogiReceiverWakeRecovery()].touchActivity(at: now)
+        }
+    }
+
     func handleInputReport(_ report: UnsafeBufferPointer<UInt8>) {
+        guard report.count >= 1 else { return }
+        if needsSessionReopen {
+            LogiSessionManager.shared.noteSessionActivityWhileBlocked(self, at: Self.continuousTimestamp())
+        }
+        if connectionMode == .bleDirect,
+           report[0] != Self.hidppShortReportId,
+           report[0] != Self.hidppLongReportId {
+            recordBLEDirectStandardInputReport(at: Self.continuousTimestamp())
+            return
+        }
         guard report.count >= 7 else { return }
         guard report[0] == Self.hidppShortReportId || report[0] == Self.hidppLongReportId else { return }
 
@@ -3517,6 +3785,8 @@ class LogiDeviceSession {
             // 缓存验证: ping 响应 (function 1) 确认设备在线, 直接用缓存的 feature index
             if let reprogIdx = pendingCacheValidation, functionId == 1 {
                 pendingCacheValidation = nil
+                discoveryTimer?.invalidate()
+                discoveryTimer = nil
                 LogiDebugPanel.log("[\(deviceInfo.name)] Cache validated (protocol \(report[4]).\(report[5])), using cached index 0x\(String(format: "%02X", reprogIdx))")
                 sendGetControlCount(featureIndex: reprogIdx)
                 return
@@ -3819,11 +4089,17 @@ class LogiDeviceSession {
             discoveryTimer?.invalidate()
             discoveryTimer = nil  // 置 nil: 否则 anyDiscoveryInFlight 会因已失效但非 nil 的 timer 永远误判在飞, 毒死 pump
             pendingDiscovery.removeValue(forKey: featureId)
+            if featureId == Self.featureReprogV4 && discoveredIndex == 0 {
+                reprogFeatureUnsupported = true
+            }
             callback(discoveredIndex == 0 ? nil : discoveredIndex)
         }
     }
 
     private func handleGetControlCountResponse(_ report: UnsafeBufferPointer<UInt8>) {
+        controlInfoQueryTimer?.invalidate()
+        controlInfoQueryTimer = nil
+        controlCountRetryCount = 0
         reprogControlCount = Int(report[4])
         reprogQueryIndex = 0
         controlInfoRetryCounts.removeAll()
@@ -3833,6 +4109,7 @@ class LogiDeviceSession {
             sendGetControlInfo(featureIndex: idx, index: 0)
         } else {
             // 设备声明 0 个可编程控件: discovery 走到终点, 记为握手完成.
+            reprogFeatureUnsupported = true
             markHandshakeComplete()
             NotificationCenter.default.post(name: LogiSessionManager.reportingQueryDidCompleteNotification, object: nil)
             LogiSessionManager.shared.recomputeAndNotifyActivityState()
@@ -3900,8 +4177,9 @@ class LogiDeviceSession {
         guard controlIndex < discoveredControls.count else { return }
         let cid = discoveredControls[controlIndex].cid
         // GetControlReporting: function 2, params: CID(2)
-        sendRequest(featureIndex: featureIndex, functionId: 2,
-                    params: [UInt8(cid >> 8), UInt8(cid & 0xFF)])
+        let status = sendRequest(featureIndex: featureIndex, functionId: 2,
+                                 params: [UInt8(cid >> 8), UInt8(cid & 0xFF)])
+        guard !Self.isPermissionDeniedIOReturn(status) else { return }
         scheduleReportingTimeout(index: controlIndex)
     }
 
@@ -4084,11 +4362,13 @@ class LogiDeviceSession {
         reconcileAppliedDivertsWithQueriedState()
         reprogInitComplete = true
         handshakeComplete = true
+        bleIncompleteRediscoveryCount = 0
         setDiscoveryInFlight(false)
         #if DEBUG
         LogiTrace.log("[Session] divertBoundControls prime registry discovered=\(discoveredControls.count)", device: deviceInfo.name)
         #endif
         primeFromRegistry()
+        seedWakeRecoveryActivity(slot: deviceIndex, at: Self.continuousTimestamp())
         LogiDebugPanel.log("[\(deviceInfo.name)] Init complete, listening for button events")
         // 正常 init 终点直接赋值 handshakeComplete, 不经过 markHandshakeComplete.
         // sweep 中: 由 receiverSlotDiscoveryDidFinish 决定推进下一个 slot 还是(巡检 slot)探测可选功能;

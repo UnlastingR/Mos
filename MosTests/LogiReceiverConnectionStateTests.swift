@@ -1,3 +1,4 @@
+import IOKit
 import XCTest
 @testable import Mos_Debug
 
@@ -464,5 +465,163 @@ final class LogiReceiverConnectionStateTests: XCTestCase {
                 slot: 1, wasConnected: true, isDivertCandidate: true, alreadyManaged: false),
             .ignore
         )
+    }
+
+    // MARK: - BLE Long-Sleep & Screen-Lock Recovery (M720 0xB015)
+
+    func testSeededWakeRecoveryProbesOnFirstWakeEventAfterIdle() {
+        var recovery = LogiReceiverWakeRecovery()
+        recovery.seedActivity(at: 100)
+        // Re-seeding later must not overwrite an existing baseline timestamp.
+        recovery.seedActivity(at: 140)
+        XCTAssertEqual(recovery.noteActivity(at: 160, expectedCIDs: wakeBindings), wakeBindings)
+    }
+
+    func testContinuousNonHIDPPActivityPreventsFalseIdleProbeUntilQuietPeriod() {
+        var recovery = LogiReceiverWakeRecovery()
+        recovery.seedActivity(at: 100)
+        recovery.touchActivity(at: 145)
+        recovery.touchActivity(at: 190)
+        // Pressing a HID++ button immediately after 90s of cursor movement must not probe.
+        XCTAssertTrue(recovery.noteActivity(at: 190.5, expectedCIDs: wakeBindings).isEmpty)
+        // After 60s of genuine idle, the very first report probes once.
+        XCTAssertEqual(recovery.noteActivity(at: 250.5, expectedCIDs: wakeBindings), wakeBindings)
+    }
+
+    func testForcedUnlockProbeStartsReadbackImmediatelyWithoutWaitingIdleThreshold() {
+        var recovery = LogiReceiverWakeRecovery()
+        recovery.seedActivity(at: 100)
+        XCTAssertEqual(recovery.beginForcedProbe(at: 110, expectedCIDs: wakeBindings), wakeBindings)
+        // Duplicate forced probe while batch is pending must be ignored.
+        XCTAssertTrue(recovery.beginForcedProbe(at: 111, expectedCIDs: wakeBindings).isEmpty)
+        XCTAssertTrue(recovery.receive(cid: 0x005B, flags: 0x00, softwareID: recovery.softwareID))
+        XCTAssertTrue(recovery.receive(cid: 0x005D, flags: 0x00, softwareID: recovery.softwareID))
+        XCTAssertTrue(recovery.receive(cid: 0x00D0, flags: 0x01, softwareID: recovery.softwareID))
+        XCTAssertEqual(recovery.finish(currentExpectedCIDs: wakeBindings), [0x005B, 0x005D])
+    }
+
+    func testPermissionDeniedIOReturnAndCompositeKeyboardClientDetection() {
+        // 0xe00002e2 (kIOReturnNotPermitted) is emitted by XNU IOHIDLibUserClient::setReport
+        // when M720 BLE (PrimaryUsage=1/6) connects while macOS Lock Screen is active.
+        XCTAssertTrue(LogiDeviceSession.isPermissionDeniedIOReturn(kIOReturnNotPermitted))
+        XCTAssertTrue(LogiDeviceSession.isPermissionDeniedIOReturn(kIOReturnNotPrivileged))
+        XCTAssertFalse(LogiDeviceSession.isPermissionDeniedIOReturn(kIOReturnSuccess))
+        XCTAssertFalse(LogiDeviceSession.isPermissionDeniedIOReturn(kIOReturnTimeout))
+
+        XCTAssertTrue(LogiDeviceSession.requiresUnlockedKeyboardClient(usagePage: 0x0001, usage: 0x0006))
+        XCTAssertFalse(LogiDeviceSession.requiresUnlockedKeyboardClient(usagePage: 0x0001, usage: 0x0002))
+        XCTAssertFalse(LogiDeviceSession.requiresUnlockedKeyboardClient(usagePage: 0xFF00, usage: 0x0001))
+    }
+
+    func testUnlockRecoveryActionAndBoundedRetries() {
+        XCTAssertEqual(
+            LogiSessionManager.unlockRecoveryAction(
+                isActive: false,
+                hasCandidateSessions: true,
+                anySessionNeedsReopen: true,
+                anyCandidateIncomplete: false
+            ),
+            .none
+        )
+        XCTAssertEqual(
+            LogiSessionManager.unlockRecoveryAction(
+                isActive: true,
+                hasCandidateSessions: false,
+                anySessionNeedsReopen: false,
+                anyCandidateIncomplete: false
+            ),
+            .none
+        )
+        XCTAssertEqual(
+            LogiSessionManager.unlockRecoveryAction(
+                isActive: true,
+                hasCandidateSessions: true,
+                anySessionNeedsReopen: true,
+                anyCandidateIncomplete: false
+            ),
+            .restartManager
+        )
+        XCTAssertEqual(
+            LogiSessionManager.unlockRecoveryAction(
+                isActive: true,
+                hasCandidateSessions: true,
+                anySessionNeedsReopen: false,
+                anyCandidateIncomplete: true
+            ),
+            .restartManager
+        )
+        XCTAssertEqual(
+            LogiSessionManager.unlockRecoveryAction(
+                isActive: true,
+                hasCandidateSessions: true,
+                anySessionNeedsReopen: false,
+                anyCandidateIncomplete: false
+            ),
+            .probeActiveSessions
+        )
+
+        XCTAssertEqual(LogiSessionManager.nextPermissionRetryDelay(completedAttempts: 0), 0.5)
+        XCTAssertEqual(LogiSessionManager.nextPermissionRetryDelay(completedAttempts: 1), 1.5)
+        XCTAssertEqual(LogiSessionManager.nextPermissionRetryDelay(completedAttempts: 2), 3.0)
+        XCTAssertNil(LogiSessionManager.nextPermissionRetryDelay(completedAttempts: 3))
+
+        XCTAssertFalse(LogiSessionManager.canAttemptLazyActivityRecovery(
+            isScreenLocked: true, completedAttempts: 0, now: 100, lastAttemptTime: 0
+        ))
+        XCTAssertTrue(LogiSessionManager.canAttemptLazyActivityRecovery(
+            isScreenLocked: false, completedAttempts: 0, now: 100, lastAttemptTime: 0
+        ))
+        XCTAssertFalse(LogiSessionManager.canAttemptLazyActivityRecovery(
+            isScreenLocked: false, completedAttempts: 1, now: 101.5, lastAttemptTime: 100
+        ))
+        XCTAssertTrue(LogiSessionManager.canAttemptLazyActivityRecovery(
+            isScreenLocked: false, completedAttempts: 1, now: 103.5, lastAttemptTime: 100
+        ))
+        XCTAssertFalse(LogiSessionManager.canAttemptLazyActivityRecovery(
+            isScreenLocked: false, completedAttempts: 2, now: 110, lastAttemptTime: 103.5
+        ))
+    }
+
+    func testIncompleteCandidateSessionDistinguishesPacketTimeoutFromUnsupportedFeature() {
+        XCTAssertTrue(LogiDeviceSession.shouldRecoverIncompleteCandidateSession(
+            connectionMode: .bleDirect,
+            handshakeComplete: false,
+            reprogInitComplete: false,
+            reprogFeatureUnsupported: false
+        ))
+        XCTAssertTrue(LogiDeviceSession.shouldRecoverIncompleteCandidateSession(
+            connectionMode: .bleDirect,
+            handshakeComplete: true,
+            reprogInitComplete: false,
+            reprogFeatureUnsupported: false
+        ))
+        XCTAssertFalse(LogiDeviceSession.shouldRecoverIncompleteCandidateSession(
+            connectionMode: .bleDirect,
+            handshakeComplete: true,
+            reprogInitComplete: false,
+            reprogFeatureUnsupported: true
+        ))
+        XCTAssertFalse(LogiDeviceSession.shouldRecoverIncompleteCandidateSession(
+            connectionMode: .bleDirect,
+            handshakeComplete: true,
+            reprogInitComplete: true,
+            reprogFeatureUnsupported: false
+        ))
+    }
+
+    func testDeliveryModeStoreResetAllClearsContendedState() {
+        let store = LogiButtonDeliveryModeStore(clearWindow: 30, clearThreshold: 2)
+        let key = LogiOwnershipKey(
+            vendorId: 0x046D,
+            productId: 0xB015,
+            name: "M720 Triathlon",
+            transport: .bleDirect,
+            cid: 0x005B
+        )
+        let t0 = Date(timeIntervalSince1970: 1_000)
+        XCTAssertEqual(store.recordExternalClear(for: key, at: t0), .hidpp)
+        XCTAssertEqual(store.recordExternalClear(for: key, at: t0.addingTimeInterval(1)), .contended)
+        store.resetAll()
+        XCTAssertEqual(store.mode(for: key), .hidpp)
     }
 }
